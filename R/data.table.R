@@ -216,7 +216,7 @@ chmatch2 <- function(x, table, nomatch=NA_integer_) {
     .Call(Cchmatch2, x, table, as.integer(nomatch)) # this is in 'rbindlist.c' for now.
 }
 
-"[.data.table" <- function (x, i, j, by, keyby, with=TRUE, nomatch=getOption("datatable.nomatch"), mult="all", roll=FALSE, rollends=if (roll=="nearest") c(TRUE,TRUE) else if (roll>=0) c(FALSE,TRUE) else c(TRUE,FALSE), which=FALSE, .SDcols, verbose=getOption("datatable.verbose"), allow.cartesian=getOption("datatable.allow.cartesian"), drop=NULL, on=NULL)
+"[.data.table" <- function (x, i, j, by, keyby, having, with=TRUE, nomatch=getOption("datatable.nomatch"), mult="all", roll=FALSE, rollends=if (roll=="nearest") c(TRUE,TRUE) else if (roll>=0) c(FALSE,TRUE) else c(TRUE,FALSE), which=FALSE, .SDcols, verbose=getOption("datatable.verbose"), allow.cartesian=getOption("datatable.allow.cartesian"), drop=NULL, on=NULL)
 {
     # ..selfcount <<- ..selfcount+1  # in dev, we check no self calls, each of which doubles overhead, or could
     # test explicitly if the caller is [.data.table (even stronger test. TO DO.)
@@ -257,6 +257,7 @@ chmatch2 <- function(x, table, nomatch=NA_integer_) {
         # or some kind of dynamic construction that has edge case of no contents inside [...]
         return(x)
     }
+
     if (!missing(keyby)) {
         if (!missing(by)) stop("Provide either 'by' or 'keyby' but not both")
         by=bysub=substitute(keyby)
@@ -264,6 +265,9 @@ chmatch2 <- function(x, table, nomatch=NA_integer_) {
     } else {
         bysub = if (missing(by)) NULL # and leave missing(by)==TRUE
                 else substitute(by)
+    }
+    if (!missing(having)){
+        if (missing(by)) stop("'having' is supplied but not 'by' or 'keyby'")
     }
     byjoin = FALSE
     if (!missing(by)) {
@@ -844,6 +848,7 @@ chmatch2 <- function(x, table, nomatch=NA_integer_) {
             allbyvars = NULL
             if (byjoin) {
                 bynames = names(x)[rightcols]
+                if (!missing(having)) stop("'having' is not supported in joins.")
             } else if (!missing(by)) {
                 # deal with by before j because we need byvars when j contains .SD 
                 # may evaluate to NULL | character() | "" | list(), likely a result of a user expression where no-grouping is one case being loop'd through 
@@ -888,7 +893,7 @@ chmatch2 <- function(x, table, nomatch=NA_integer_) {
                     bysubl = as.list.default(bysub)
                 }
                 allbyvars = intersect(all.vars(bysub),names(x))
-                
+              
                 orderedirows = .Call(CisOrderedSubset, irows, nrow(x))  # TRUE when irows is NULL (i.e. no i clause)
                 # orderedirows = is.sorted(f__)
                 bysameorder = orderedirows && haskey(x) && all(vapply_1b(bysubl,is.name)) && length(allbyvars) && identical(allbyvars,head(key(x),length(allbyvars)))
@@ -1771,7 +1776,82 @@ chmatch2 <- function(x, table, nomatch=NA_integer_) {
         # for consistency of empty case in test 184
         f__=len__=0L
     }
-    if (verbose) {last.started.at=proc.time()[3];cat("Making each group and running j (GForce ",GForce,") ... ",sep="");flush.console()}
+    if (verbose) {
+        last.started.at=proc.time()[3]
+        if (!missing(having))
+            cat("Making each group, filtering by 'having' and running j (GForce ",GForce,") ... ",sep="")
+        else 
+            cat("Making each group and running j (GForce ",GForce,") ... ",sep="")
+        flush.console()
+    }
+
+    if (!missing(having)){
+        # WIP
+
+        # create objects for 'having' doGroups
+        hsub = replace_dot_alias(substitute(having))
+        hav = all.vars(hsub)
+        hansvars = setdiff(intersect(hav,names(x)), bynames)
+        if (verbose) cat("\nDetected that 'having' uses these columns:",if (!length(hansvars)) "<none>" else paste(hansvars, collapse=","),"\n")
+        hansvals = chmatch(hansvars, names(x))
+        if (!any(hwna <- is.na(hansvals))) {
+            hxcols = hansvals
+        } else {
+            stop("column(s) not found: ", paste(hansvars[hwna], collapse=", "))
+        }
+
+        hSDenv = new.env(parent=parent.frame())
+        hSDenv$.SDall = hSDenv$.SD = null.data.table()
+        setattr(hSDenv$.SDall,"row.names",c(NA_integer_,0L))
+        setattr(hSDenv$.SD,"row.names",c(NA_integer_,0L))
+        hSDenv$.iSD = NULL
+        hSDenv$.xSD = NULL
+        hSDenv$.N = as.integer(0)
+        hSDenv$.GRP = as.integer(1)
+        assign("print", function(x,...){base::print(x,...);NULL}, hSDenv)
+
+        alloc = if (length(len__)) seq_len(max(len__)) else 0L
+        hSDenv$.I = alloc
+        if (length(hxcols)) {
+            hSDenv$.SDall = .Call(CsubsetDT,x,alloc,hxcols)
+            hSDenv$.SD = shallow(hSDenv$.SDall)
+        }
+        setattr(hSDenv$.SD,".data.table.locked",TRUE)
+        setattr(hSDenv$.SDall,".data.table.locked",TRUE)
+        lockBinding(".SD",hSDenv)
+        lockBinding(".SDall",hSDenv)
+        lockBinding(".N",hSDenv)
+        lockBinding(".GRP",hSDenv)
+        lockBinding(".I",hSDenv)
+        lockBinding(".iSD",hSDenv)
+
+        hcols = hjiscols = hxjiscols = NULL
+        hnewnames = NULL
+        hon = FALSE
+        hverbose = FALSE
+
+        # 'having' doGroups
+        # seems like i should use xss here.. no concern about :=
+        hans = .Call(Cdogroups, x, hxcols, groups, grpcols, hjiscols, xjiscols, grporder, o__, f__, len__, hsub, hSDenv, hcols, hnewnames, hon, hverbose)
+
+        # temp, for debugging
+        print(hans); .hans <<- hans
+
+        if (length(hans) > length(grpcols) + 1L) stop("'having' should evaluate to a single vector.")
+        # add a check that one it evaluates to a single value per group
+        # something like 
+
+        groupi = last(hans)
+        if (length(groupi) > length(f__)) stop("'having' should evaluate to a single value per group.")
+
+        # filter stuff
+        if (!any(groupi)) return(null.data.table())
+
+        f__ = f__[groupi]
+        len__ = len__[groupi]
+        
+    }
+
     if (GForce) {
         thisEnv = new.env()  # not parent=parent.frame() so that gsum is found
         for (ii in ansvars) assign(ii, x[[ii]], thisEnv)
